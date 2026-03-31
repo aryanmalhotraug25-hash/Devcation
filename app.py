@@ -182,7 +182,12 @@ def compute_acoustic_metrics(filepath):
 # ================================================================
 # REFERENCE-BASED DETECTION — compares against demo files
 # ================================================================
-AUDIO_PATHS = {"fake": "demo_audio/fake_scam.wav", "real": "demo_audio/real.wav"}
+BASE_DIR = os.path.dirname(__file__)
+
+AUDIO_PATHS = {
+    "fake": os.path.join(BASE_DIR, "demo_audio", "fake_scam.wav"),
+    "real": os.path.join(BASE_DIR, "demo_audio", "real.wav")
+}
 
 @st.cache_resource
 def load_reference_metrics():
