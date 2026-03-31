@@ -964,8 +964,8 @@ elif st.session_state.app_state == "dashboard":
     metrics = st.session_state.acoustic_metrics
     amethod = st.session_state.analysis_method
 
-    verdict = "AI-GENERATED" if ai_prob >= 60 else "HUMAN VOICE"
-    vcls = "c-red" if ai_prob >= 60 else "c-grn"
+    verdict = "AI-GENERATED" if ai_prob >= 55 else "HUMAN VOICE"
+    vcls = "c-red" if ai_prob >= 55 else "c-grn"
 
     lcfg = {
         "CRITICAL": ("🚨","tb-crit","#ff4444","c-red","BLOCK — DEEPFAKE SCAM"),
