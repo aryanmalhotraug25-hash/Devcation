@@ -784,15 +784,15 @@ def get_ai_probability(audio_path, metrics=None, call_type=None):
 
     if model_prob is not None:
         scores.append(model_prob)
-        weights.append(0.55)  # Slightly reduced — model may overfit on 2 files
+        weights.append(0.75)  # Slightly reduced — model may overfit on 2 files
         methods.append("🧠 ML Model")
     if ref_prob is not None:
         scores.append(ref_prob)
-        weights.append(0.20)
+        weights.append(0.10)
         methods.append("📐 Reference")
     if heur_prob is not None:
         scores.append(heur_prob)
-        weights.append(0.25)  # Increased — heuristic is more generalizable
+        weights.append(0.15)  # Increased — heuristic is more generalizable
         methods.append("🔬 Heuristic")
 
     if scores:
