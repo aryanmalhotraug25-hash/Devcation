@@ -387,8 +387,13 @@ def main():
     # 3. Cross-validate
     print("\n[3/5] Cross-validating …")
     clf = RandomForestClassifier(
-        n_estimators=200, max_depth=20, min_samples_split=3,
-        min_samples_leaf=1, random_state=42, n_jobs=-1,
+    n_estimators=200,
+    max_depth=20,
+    min_samples_split=3,
+    min_samples_leaf=1,
+    class_weight='balanced',  
+    random_state=42,
+    n_jobs=-1,
     )
 
     n_splits = min(5, min(np.sum(y == 0), np.sum(y == 1)))

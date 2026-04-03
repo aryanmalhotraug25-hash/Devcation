@@ -1,7 +1,7 @@
 """
 =================================================================
- VoiceGuard Pro v6.0 — Real-Time Deepfake Scam Detector
- Reference-based detection + In-app calibration + 16-metric heuristic
+ VoiceGuard Pro v7.0 — Real-Time Deepfake Scam Detector
+ FIXED: Enhanced features, segment voting, better heuristics
 =================================================================
  Run:  streamlit run app.py
 =================================================================
@@ -89,25 +89,70 @@ def save_uploaded_to_temp(src, suf=".wav"):
 
 
 # ================================================================
-# FEATURE EXTRACTION — 132 features
+# FEATURE EXTRACTION — 193 features (was 132)
 # ================================================================
-N_FEATURES = 132
+# NEW: Added delta-delta MFCCs (40), spectral contrast (7),
+#      HNR stats (2), chroma energy (12)
+# ================================================================
+N_FEATURES = 193
 
 def extract_features_from_array(y, sr, n_mfcc=40):
+    """Extract 193 features: MFCCs + deltas + delta-deltas + spectral + HNR + contrast + chroma."""
     import librosa
+
+    # --- MFCCs and derivatives ---
     mfccs = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=n_mfcc)
-    delta = librosa.feature.delta(mfccs)
+    delta1 = librosa.feature.delta(mfccs)
+    delta2 = librosa.feature.delta(mfccs, order=2)  # NEW: delta-delta
+
+    # --- Spectral features ---
     sc = librosa.feature.spectral_centroid(y=y, sr=sr)[0]
     sb = librosa.feature.spectral_bandwidth(y=y, sr=sr)[0]
     sf = librosa.feature.spectral_flatness(y=y)[0]
     sro = librosa.feature.spectral_rolloff(y=y, sr=sr)[0]
     zc = librosa.feature.zero_crossing_rate(y)[0]
     rm = librosa.feature.rms(y=y)[0]
-    spectral = np.array([np.mean(sc),np.std(sc),np.mean(sb),np.std(sb),
-                         np.mean(sf),np.std(sf),np.mean(sro),np.std(sro),
-                         np.mean(zc),np.std(zc),np.mean(rm),np.std(rm)], dtype=np.float32)
-    return np.concatenate([np.mean(mfccs,axis=1), np.std(mfccs,axis=1),
-                           np.mean(delta,axis=1), spectral]).astype(np.float32)
+
+    spectral = np.array([
+        np.mean(sc), np.std(sc),
+        np.mean(sb), np.std(sb),
+        np.mean(sf), np.std(sf),
+        np.mean(sro), np.std(sro),
+        np.mean(zc), np.std(zc),
+        np.mean(rm), np.std(rm),
+    ], dtype=np.float32)
+
+    # --- NEW: Harmonic-to-Noise Ratio ---
+    # AI voices tend to have abnormally HIGH HNR (too clean)
+    try:
+        harmonic, percussive = librosa.effects.hpss(y)
+        hnr_ratio = np.mean(np.abs(harmonic)) / (np.mean(np.abs(percussive)) + 1e-8)
+        hnr_std = np.std(np.abs(harmonic)) / (np.std(np.abs(percussive)) + 1e-8)
+    except:
+        hnr_ratio, hnr_std = 1.0, 1.0
+    hnr_feats = np.array([hnr_ratio, hnr_std], dtype=np.float32)
+
+    # --- NEW: Spectral Contrast (7 bands) ---
+    # AI voices show less contrast between peaks and valleys
+    try:
+        contrast = librosa.feature.spectral_contrast(y=y, sr=sr, n_bands=6)
+        contrast_mean = np.mean(contrast, axis=1)  # 7 values
+    except:
+        contrast_mean = np.zeros(7, dtype=np.float32)
+
+    return np.concatenate([
+        np.mean(mfccs, axis=1),    # 40
+        np.std(mfccs, axis=1),     # 40
+        np.mean(delta1, axis=1),   # 40
+        np.mean(delta2, axis=1),   # 40 — NEW
+        spectral,                   # 12
+        hnr_feats,                  # 2  — NEW
+        contrast_mean,              # 7  — NEW
+        np.mean(
+            librosa.feature.chroma_stft(y=y, sr=sr),
+            axis=1
+        ),                          # 12 — NEW
+    ]).astype(np.float32)           # Total: 193
 
 
 def extract_features(filepath, max_dur=15):
@@ -118,7 +163,43 @@ def extract_features(filepath, max_dur=15):
 
 
 # ================================================================
-# ACOUSTIC METRICS — 16 dimensions
+# SEGMENT-LEVEL FEATURE EXTRACTION — KEY FIX
+# ================================================================
+def extract_features_segments(filepath, seg_duration=3.0, hop_duration=1.5, max_dur=15):
+    """
+    Extract features from multiple overlapping segments.
+    Returns list of feature vectors for voting.
+    """
+    y, sr = safe_load_audio(filepath, sr=22050, duration=max_dur)
+    if y is None or len(y) < int(sr * 1.0):
+        return []
+
+    seg_len = int(seg_duration * sr)
+    hop_len = int(hop_duration * sr)
+    features_list = []
+
+    for start in range(0, len(y) - seg_len + 1, hop_len):
+        segment = y[start:start + seg_len]
+        try:
+            feat = extract_features_from_array(segment, sr)
+            if feat is not None and len(feat) == N_FEATURES:
+                features_list.append(feat)
+        except:
+            continue
+
+    # Also extract from full audio
+    try:
+        full_feat = extract_features_from_array(y, sr)
+        if full_feat is not None and len(full_feat) == N_FEATURES:
+            features_list.append(full_feat)
+    except:
+        pass
+
+    return features_list
+
+
+# ================================================================
+# ACOUSTIC METRICS — 20 dimensions (was 16)
 # ================================================================
 def compute_acoustic_metrics(filepath):
     import librosa
@@ -133,31 +214,68 @@ def compute_acoustic_metrics(filepath):
         zc = librosa.feature.zero_crossing_rate(y)[0]
         rm = librosa.feature.rms(y=y)[0]
         S = np.abs(librosa.stft(y))
-        flux = np.sqrt(np.sum(np.diff(S,axis=1)**2, axis=0)) if S.shape[1]>1 else np.array([0.0])
-        traj = float(np.mean(np.abs(np.diff(mfccs,axis=1)))) if mfccs.shape[1]>1 else 5.0
+        flux = np.sqrt(np.sum(np.diff(S, axis=1)**2, axis=0)) if S.shape[1] > 1 else np.array([0.0])
+        traj = float(np.mean(np.abs(np.diff(mfccs, axis=1)))) if mfccs.shape[1] > 1 else 5.0
 
+        # --- Pitch analysis ---
         try:
-            pitches, mags = librosa.piptrack(y=y, sr=sr, threshold=0.1)
-            pv = []
-            for t in range(pitches.shape[1]):
-                idx = mags[:,t].argmax()
-                p = pitches[idx,t]
-                if 60 < p < 600: pv.append(p)
-            if len(pv) > 10:
-                pa = np.array(pv)
-                pj = float(np.mean(np.abs(np.diff(pa)))/(np.mean(pa)+1e-8))
-                ps = float(np.std(pa)/(np.mean(pa)+1e-8))
-            else: pj, ps = 0.02, 0.06
-        except: pj, ps = 0.02, 0.06
+            f0, voiced_flag, voiced_prob = librosa.pyin(
+                y, fmin=50, fmax=600, sr=sr
+            )
+            f0_clean = f0[~np.isnan(f0)] if f0 is not None else np.array([])
 
-        shim = float(np.mean(np.abs(np.diff(rm)))/(np.mean(rm)+1e-8)) if len(rm)>2 else 0.2
-        probs = rm/(np.sum(rm)+1e-8); probs = probs[probs>1e-10]
-        entropy = float(-np.sum(probs*np.log2(probs))) if len(probs)>0 else 5.0
-        bw_cv = float(np.std(sb)/(np.mean(sb)+1e-8))
-        mfcc_cv = float(np.mean(np.std(mfccs,axis=1)/(np.abs(np.mean(mfccs,axis=1))+1e-8)))
+            if len(f0_clean) > 10:
+                pj = float(np.mean(np.abs(np.diff(f0_clean))) / (np.mean(f0_clean) + 1e-8))
+                ps = float(np.std(f0_clean) / (np.mean(f0_clean) + 1e-8))
+                # NEW: Pitch range ratio
+                pitch_range = float((np.max(f0_clean) - np.min(f0_clean)) / (np.mean(f0_clean) + 1e-8))
+            else:
+                pj, ps, pitch_range = 0.02, 0.06, 0.3
+        except:
+            pj, ps, pitch_range = 0.02, 0.06, 0.3
+
+        # --- Shimmer ---
+        shim = float(np.mean(np.abs(np.diff(rm))) / (np.mean(rm) + 1e-8)) if len(rm) > 2 else 0.2
+
+        # --- Energy entropy ---
+        probs = rm / (np.sum(rm) + 1e-8)
+        probs = probs[probs > 1e-10]
+        entropy = float(-np.sum(probs * np.log2(probs))) if len(probs) > 0 else 5.0
+
+        bw_cv = float(np.std(sb) / (np.mean(sb) + 1e-8))
+        mfcc_cv = float(np.mean(np.std(mfccs, axis=1) / (np.abs(np.mean(mfccs, axis=1)) + 1e-8)))
+
+        # --- NEW: Harmonic-to-Noise Ratio ---
+        try:
+            harmonic, percussive = librosa.effects.hpss(y)
+            hnr = float(np.mean(np.abs(harmonic)) / (np.mean(np.abs(percussive)) + 1e-8))
+        except:
+            hnr = 1.0
+
+        # --- NEW: Silence/breathing ratio ---
+        # AI voices often lack natural pauses
+        silence_threshold = np.percentile(np.abs(y), 10)
+        silence_ratio = float(np.sum(np.abs(y) < silence_threshold * 3) / len(y))
+
+        # --- NEW: Spectral contrast variance ---
+        try:
+            contrast = librosa.feature.spectral_contrast(y=y, sr=sr, n_bands=6)
+            contrast_var = float(np.mean(np.std(contrast, axis=1)))
+        except:
+            contrast_var = 10.0
+
+        # --- NEW: Sub-band energy consistency ---
+        # AI voices have unnaturally even energy across sub-bands
+        try:
+            mel_spec = librosa.feature.melspectrogram(y=y, sr=sr, n_mels=8)
+            mel_db = librosa.power_to_db(mel_spec)
+            band_energies = np.mean(mel_db, axis=1)
+            subband_consistency = float(np.std(band_energies))
+        except:
+            subband_consistency = 10.0
 
         return {
-            "mfcc_variance": float(np.mean(np.std(mfccs,axis=1))),
+            "mfcc_variance": float(np.mean(np.std(mfccs, axis=1))),
             "mfcc_cv": mfcc_cv,
             "delta_energy": float(np.mean(np.abs(delta))),
             "spectral_flatness": float(np.mean(sf)),
@@ -170,17 +288,23 @@ def compute_acoustic_metrics(filepath):
             "temporal_smoothness": traj,
             "pitch_jitter": pj,
             "pitch_stability": ps,
+            "pitch_range": pitch_range,          # NEW
             "shimmer": shim,
             "spectral_flux_mean": float(np.mean(flux)),
             "spectral_flux_std": float(np.std(flux)),
             "energy_entropy": entropy,
             "bandwidth_cv": bw_cv,
+            "hnr": hnr,                          # NEW
+            "silence_ratio": silence_ratio,       # NEW
+            "contrast_variance": contrast_var,    # NEW
+            "subband_consistency": subband_consistency,  # NEW
         }
-    except: return None
+    except:
+        return None
 
 
 # ================================================================
-# REFERENCE-BASED DETECTION — compares against demo files
+# REFERENCE-BASED DETECTION
 # ================================================================
 BASE_DIR = os.path.dirname(__file__)
 
@@ -191,7 +315,6 @@ AUDIO_PATHS = {
 
 @st.cache_resource
 def load_reference_metrics():
-    """Load acoustic metrics from demo files for comparison."""
     refs = {}
     for key, path in AUDIO_PATHS.items():
         if os.path.isfile(path):
@@ -204,10 +327,6 @@ REFS = load_reference_metrics()
 
 
 def reference_based_score(new_metrics):
-    """
-    Compare new audio metrics against real.wav and fake_scam.wav.
-    Returns 0-100 (100 = very close to fake, 0 = very close to real).
-    """
     if not REFS or "real" not in REFS or "fake" not in REFS or not new_metrics:
         return None
 
@@ -222,12 +341,10 @@ def reference_based_score(new_metrics):
     real_vec = np.array([real_ref[k] for k in keys])
     fake_vec = np.array([fake_ref[k] for k in keys])
 
-    # Normalize each dimension by the range between real and fake
     ranges = np.abs(fake_vec - real_vec) + 1e-10
     new_norm = (new_vec - real_vec) / ranges
-    fake_norm = (fake_vec - real_vec) / ranges  # Should be ~1.0 for each
+    fake_norm = (fake_vec - real_vec) / ranges
 
-    # Weighted Euclidean distance (weight important metrics more)
     weight_map = {
         "pitch_jitter": 3.0, "shimmer": 2.5, "mfcc_variance": 2.0,
         "delta_energy": 2.0, "spectral_flatness": 2.0,
@@ -238,6 +355,9 @@ def reference_based_score(new_metrics):
         "bandwidth_cv": 1.0, "mfcc_cv": 1.5,
         "spectral_flux_std": 1.0, "spectral_centroid": 0.5,
         "zcr_mean": 0.5,
+        "hnr": 2.5, "pitch_range": 2.0,                # NEW
+        "silence_ratio": 1.8, "contrast_variance": 1.5,  # NEW
+        "subband_consistency": 1.2,                       # NEW
     }
     weights = np.array([weight_map.get(k, 1.0) for k in keys])
 
@@ -251,9 +371,14 @@ def reference_based_score(new_metrics):
 
 
 # ================================================================
-# STANDALONE HEURISTIC (backup when no reference files exist)
+# STANDALONE HEURISTIC — RECALIBRATED (was inaccurate)
 # ================================================================
 def heuristic_ai_score(metrics):
+    """
+    16+ metric heuristic with recalibrated thresholds.
+    Key insight: AI voices are TOO PERFECT — too smooth, too consistent,
+    too little variation. We detect the ABSENCE of natural imperfections.
+    """
     if not metrics:
         return None
 
@@ -261,38 +386,163 @@ def heuristic_ai_score(metrics):
         return max(0.0, min(1.0, x))
 
     def score_low(val, lo, hi):
+        """Score HIGH when value is LOW (suspiciously smooth/consistent)."""
         if val >= hi: return 0.0
         if val <= lo: return 1.0
-        return clamp01(1.0 - (val-lo)/(hi-lo+1e-12))
+        return clamp01(1.0 - (val - lo) / (hi - lo + 1e-12))
 
     def score_high(val, lo, hi):
+        """Score HIGH when value is HIGH (suspiciously elevated)."""
         if val <= lo: return 0.0
         if val >= hi: return 1.0
-        return clamp01((val-lo)/(hi-lo+1e-12))
+        return clamp01((val - lo) / (hi - lo + 1e-12))
 
-    s = {}
-    w = {}
+    indicators = {}
+    weights = {}
 
-    s["mfcc"] = score_low(metrics["mfcc_variance"], 15, 50); w["mfcc"] = 12
-    s["delta"] = score_low(metrics["delta_energy"], 0.8, 4.5); w["delta"] = 12
-    s["flat"] = score_high(metrics["spectral_flatness"], 0.02, 0.10); w["flat"] = 10
-    s["tsmooth"] = score_low(metrics["temporal_smoothness"], 1.2, 6.0); w["tsmooth"] = 10
-    s["rms"] = score_low(metrics["rms_dynamics"], 0.006, 0.04); w["rms"] = 8
-    s["fcons"] = score_low(metrics["flatness_consistency"], 0.015, 0.08); w["fcons"] = 8
-    s["cent"] = score_low(metrics["centroid_variation"], 100, 700); w["cent"] = 7
-    s["jitter"] = score_low(metrics.get("pitch_jitter",0.02), 0.005, 0.035); w["jitter"] = 16
-    s["pstab"] = score_low(metrics.get("pitch_stability",0.06), 0.02, 0.12); w["pstab"] = 12
-    s["shimmer"] = score_low(metrics.get("shimmer",0.2), 0.06, 0.35); w["shimmer"] = 14
-    s["entropy"] = score_low(metrics.get("energy_entropy",5), 2.0, 6.5); w["entropy"] = 7
-    s["flux"] = score_low(metrics.get("spectral_flux_mean",5), 0.8, 6.0); w["flux"] = 8
-    s["fluxs"] = score_low(metrics.get("spectral_flux_std",5), 0.5, 6.0); w["fluxs"] = 5
-    s["zcr"] = score_low(metrics["zcr_variation"], 0.008, 0.04); w["zcr"] = 5
-    s["bwcv"] = score_low(metrics.get("bandwidth_cv",0.15), 0.04, 0.20); w["bwcv"] = 5
-    s["mcv"] = score_low(metrics.get("mfcc_cv",0.5), 0.12, 0.65); w["mcv"] = 7
+    # === PITCH ANALYSIS (most discriminative for deepfakes) ===
+    # AI voices have very low jitter (too perfect pitch control)
+    indicators["jitter"] = score_low(
+        metrics.get("pitch_jitter", 0.02), 0.005, 0.025
+    )
+    weights["jitter"] = 18
 
-    tw = sum(w.values())
-    ws = sum(s[k]*w[k] for k in s)
-    return min(round((ws/tw)*100, 1), 99.0)
+    # AI voices have unnaturally stable pitch (low coefficient of variation)
+    indicators["pstab"] = score_low(
+        metrics.get("pitch_stability", 0.06), 0.03, 0.15
+    )
+    weights["pstab"] = 15
+
+    # AI voices have limited pitch range
+    indicators["prange"] = score_low(
+        metrics.get("pitch_range", 0.3), 0.1, 0.5
+    )
+    weights["prange"] = 12
+
+    # === AMPLITUDE/ENERGY ANALYSIS ===
+    # AI voices have very low shimmer (too consistent amplitude)
+    indicators["shimmer"] = score_low(
+        metrics.get("shimmer", 0.2), 0.04, 0.25
+    )
+    weights["shimmer"] = 14
+
+    # AI voices have low RMS dynamics (flat energy contour)
+    indicators["rms"] = score_low(
+        metrics["rms_dynamics"], 0.005, 0.035
+    )
+    weights["rms"] = 10
+
+    # === SPECTRAL ANALYSIS ===
+    # AI voices have higher spectral flatness (more noise-like spectrum)
+    indicators["flat"] = score_high(
+        metrics["spectral_flatness"], 0.01, 0.08
+    )
+    weights["flat"] = 10
+
+    # AI voices have very consistent flatness (low variation)
+    indicators["fcons"] = score_low(
+        metrics["flatness_consistency"], 0.01, 0.06
+    )
+    weights["fcons"] = 8
+
+    # Low spectral flux = too smooth transitions
+    indicators["flux"] = score_low(
+        metrics.get("spectral_flux_mean", 5), 0.5, 5.0
+    )
+    weights["flux"] = 8
+
+    # === MFCC ANALYSIS ===
+    # AI voices have lower MFCC variance (too uniform vocal tract)
+    indicators["mfcc"] = score_low(
+        metrics["mfcc_variance"], 15, 40
+    )
+    weights["mfcc"] = 12
+
+    # AI voices have lower MFCC coefficient of variation
+    indicators["mcv"] = score_low(
+        metrics.get("mfcc_cv", 0.5), 0.08, 0.50
+    )
+    weights["mcv"] = 8
+
+    # AI voices have lower delta energy (less dynamic articulation)
+    indicators["delta"] = score_low(
+        metrics["delta_energy"], 0.5, 3.5
+    )
+    weights["delta"] = 12
+
+    # === TEMPORAL ANALYSIS ===
+    # AI voices have low temporal smoothness value (paradoxically,
+    # because trajectory changes are small = too smooth)
+    indicators["tsmooth"] = score_low(
+        metrics["temporal_smoothness"], 1.0, 5.0
+    )
+    weights["tsmooth"] = 10
+
+    # === NEW METRICS ===
+    # AI voices have abnormally high HNR (too clean, no breathiness)
+    if "hnr" in metrics:
+        indicators["hnr"] = score_high(
+            metrics["hnr"], 2.0, 8.0
+        )
+        weights["hnr"] = 14
+
+    # AI voices lack natural silences/breathing
+    if "silence_ratio" in metrics:
+        indicators["silence"] = score_low(
+            metrics["silence_ratio"], 0.02, 0.15
+        )
+        weights["silence"] = 8
+
+    # AI voices have lower spectral contrast variance
+    if "contrast_variance" in metrics:
+        indicators["contrast"] = score_low(
+            metrics["contrast_variance"], 5.0, 20.0
+        )
+        weights["contrast"] = 8
+
+    # AI voices have lower sub-band energy variance (too even)
+    if "subband_consistency" in metrics:
+        indicators["subband"] = score_low(
+            metrics["subband_consistency"], 3.0, 15.0
+        )
+        weights["subband"] = 6
+
+    # Low centroid variation = monotonic spectral character
+    indicators["cent"] = score_low(
+        metrics["centroid_variation"], 80, 500
+    )
+    weights["cent"] = 6
+
+    # Low ZCR variation
+    indicators["zcr"] = score_low(
+        metrics["zcr_variation"], 0.005, 0.03
+    )
+    weights["zcr"] = 5
+
+    # Energy entropy
+    indicators["entropy"] = score_low(
+        metrics.get("energy_entropy", 5), 2.0, 6.0
+    )
+    weights["entropy"] = 6
+
+    # Bandwidth CV
+    indicators["bwcv"] = score_low(
+        metrics.get("bandwidth_cv", 0.15), 0.03, 0.18
+    )
+    weights["bwcv"] = 5
+
+    # === AGGREGATE ===
+    tw = sum(weights.values())
+    ws = sum(indicators[k] * weights[k] for k in indicators)
+    raw_score = (ws / tw) * 100.0
+
+    # Apply sigmoid-like shaping to push scores away from 50%
+    # This reduces "uncertain" results
+    centered = (raw_score - 50.0) / 50.0  # -1 to 1
+    shaped = centered * abs(centered)       # quadratic shaping
+    final = 50.0 + shaped * 50.0
+
+    return min(round(final, 1), 99.0)
 
 
 # ================================================================
@@ -304,6 +554,10 @@ def _load_model(path="voiceguard_model.pkl"):
     try:
         m = joblib.load(path)
         if hasattr(m, "n_features_in_") and m.n_features_in_ != N_FEATURES:
+            st.sidebar.warning(
+                f"⚠️ Model expects {m.n_features_in_} features, "
+                f"but app extracts {N_FEATURES}. Retrain needed!"
+            )
             return None
         return m
     except: return None
@@ -312,46 +566,74 @@ MODEL = _load_model()
 
 
 # ================================================================
-# IN-APP CALIBRATION — trains model from demo files
+# IN-APP CALIBRATION — IMPROVED
 # ================================================================
 def calibrate_model_from_demo():
-    """Train a real model from demo audio files. Returns success bool."""
+    """Train model from demo files with better augmentation & model."""
     import librosa
+
+    # Try GradientBoosting first (better for this task), fall back to RF
+    try:
+        from sklearn.ensemble import GradientBoostingClassifier
+        USE_GB = True
+    except:
+        USE_GB = False
+
     from sklearn.ensemble import RandomForestClassifier
 
     X_all, y_all = [], []
 
     for label, path in [(0, AUDIO_PATHS["real"]), (1, AUDIO_PATHS["fake"])]:
-        y_audio, sr = safe_load_audio(path, sr=22050, duration=30)
+        y_audio, sr = safe_load_audio(path, sr=22050, duration=60)
         if y_audio is None or len(y_audio) < sr:
             return False, f"Could not load {path}"
 
-        # Segment into 2s windows with 0.5s hop
+        # Segment into overlapping 2s windows
         seg_len = int(2.0 * sr)
-        hop_len = int(0.5 * sr)
-        segments = []
+        hop_len = int(0.3 * sr)  # More overlap = more samples
+
         for start in range(0, len(y_audio) - seg_len + 1, hop_len):
-            segments.append(y_audio[start:start+seg_len])
+            seg = y_audio[start:start + seg_len]
 
-        for seg in segments:
             augmented = [seg.copy()]
-            augmented.append(seg + np.random.normal(0, 0.003, len(seg)).astype(np.float32))
-            augmented.append(seg + np.random.normal(0, 0.008, len(seg)).astype(np.float32))
-            augmented.append(seg * 1.4)
-            augmented.append(seg * 0.7)
 
+            # Noise augmentation (multiple levels)
+            for noise_level in [0.001, 0.003, 0.006, 0.01, 0.015]:
+                augmented.append(
+                    seg + np.random.normal(0, noise_level, len(seg)).astype(np.float32)
+                )
+
+            # Volume augmentation
+            for gain in [0.5, 0.7, 0.85, 1.2, 1.5, 2.0]:
+                augmented.append(np.clip(seg * gain, -1.0, 1.0).astype(np.float32))
+
+            # Time stretch
+            for rate in [0.85, 0.9, 0.95, 1.05, 1.1, 1.15]:
+                try:
+                    ys = librosa.effects.time_stretch(seg, rate=rate)
+                    if len(ys) >= seg_len:
+                        augmented.append(ys[:seg_len])
+                    elif len(ys) > sr:
+                        padded = np.pad(ys, (0, seg_len - len(ys)))
+                        augmented.append(padded)
+                except:
+                    pass
+
+            # Pitch shift
+            for n_steps in [-3, -2, -1, -0.5, 0.5, 1, 2, 3]:
+                try:
+                    yp = librosa.effects.pitch_shift(seg, sr=sr, n_steps=n_steps)
+                    augmented.append(yp)
+                except:
+                    pass
+
+            # Combined augmentations (noise + pitch, noise + volume)
             try:
-                yf = librosa.effects.time_stretch(seg, rate=1.1)
-                if len(yf) >= len(seg): augmented.append(yf[:len(seg)])
-            except: pass
-            try:
-                ys = librosa.effects.time_stretch(seg, rate=0.9)
-                if len(ys) >= len(seg): augmented.append(ys[:len(seg)])
-            except: pass
-            try: augmented.append(librosa.effects.pitch_shift(seg, sr=sr, n_steps=1.5))
-            except: pass
-            try: augmented.append(librosa.effects.pitch_shift(seg, sr=sr, n_steps=-1.5))
-            except: pass
+                noisy = seg + np.random.normal(0, 0.005, len(seg)).astype(np.float32)
+                yp = librosa.effects.pitch_shift(noisy, sr=sr, n_steps=1)
+                augmented.append(yp)
+            except:
+                pass
 
             for aug_y in augmented:
                 try:
@@ -359,104 +641,174 @@ def calibrate_model_from_demo():
                     if feat is not None and len(feat) == N_FEATURES:
                         X_all.append(feat)
                         y_all.append(label)
-                except: continue
+                except:
+                    continue
 
-    if len(X_all) < 20:
+    if len(X_all) < 40:
         return False, "Too few samples generated"
 
     X = np.array(X_all)
     y = np.array(y_all)
 
-    clf = RandomForestClassifier(
-        n_estimators=200, max_depth=20, min_samples_split=3,
-        min_samples_leaf=1, random_state=42, n_jobs=-1
-    )
+    # Shuffle
+    idx = np.random.permutation(len(X))
+    X, y = X[idx], y[idx]
+
+    if USE_GB:
+        clf = GradientBoostingClassifier(
+            n_estimators=300,
+            max_depth=6,
+            learning_rate=0.05,
+            min_samples_split=5,
+            min_samples_leaf=3,
+            subsample=0.8,
+            random_state=42,
+        )
+    else:
+        clf = RandomForestClassifier(
+            n_estimators=500,
+            max_depth=25,
+            min_samples_split=3,
+            min_samples_leaf=1,
+            max_features='sqrt',
+            class_weight='balanced',
+            random_state=42,
+            n_jobs=-1,
+        )
+
     clf.fit(X, y)
 
-    # Verify
+    # Verify on original files
     real_y, real_sr = safe_load_audio(AUDIO_PATHS["real"], sr=22050, duration=15)
     fake_y, fake_sr = safe_load_audio(AUDIO_PATHS["fake"], sr=22050, duration=15)
 
+    fi = list(clf.classes_).index(1)
+
+    real_score = -1
     if real_y is not None:
         rf = extract_features_from_array(real_y, real_sr)
-        rp = clf.predict_proba(rf.reshape(1,-1))[0]
-        fi = list(clf.classes_).index(1)
+        rp = clf.predict_proba(rf.reshape(1, -1))[0]
         real_score = rp[fi] * 100
-    else:
-        real_score = -1
 
+    fake_score = -1
     if fake_y is not None:
         ff = extract_features_from_array(fake_y, fake_sr)
-        fp = clf.predict_proba(ff.reshape(1,-1))[0]
-        fi = list(clf.classes_).index(1)
+        fp = clf.predict_proba(ff.reshape(1, -1))[0]
         fake_score = fp[fi] * 100
-    else:
-        fake_score = -1
 
     joblib.dump(clf, "voiceguard_model.pkl")
-    n_real = int(np.sum(y==0))
-    n_fake = int(np.sum(y==1))
+    n_real = int(np.sum(y == 0))
+    n_fake = int(np.sum(y == 1))
+    model_name = "GradientBoosting" if USE_GB else "RandomForest"
 
-    return True, (f"Trained on {len(X)} samples (Real:{n_real} Fake:{n_fake}). "
-                  f"Real.wav → {real_score:.1f}% AI, Fake.wav → {fake_score:.1f}% AI")
+    return True, (
+        f"{model_name} trained on {len(X)} samples (Real:{n_real} Fake:{n_fake}). "
+        f"Real.wav → {real_score:.1f}% AI, Fake.wav → {fake_score:.1f}% AI"
+    )
 
 
 # ================================================================
-# COMBINED AI PROBABILITY — 4 layers
+# COMBINED AI PROBABILITY — IMPROVED with segment voting
 # ================================================================
 def get_ai_probability(audio_path, metrics=None, call_type=None):
     """
-    Four-layer detection:
-      1. ML model (trained on demo files)
-      2. Reference-based comparison (distance in metric space)
-      3. Heuristic scoring (16 dimensions)
+    Multi-layer detection with segment-level voting:
+      1. ML model (segment voting)
+      2. Reference-based comparison
+      3. Heuristic scoring
       4. Fallback
     """
     model_prob = None
     ref_prob = None
     heur_prob = None
 
-    # Layer 1: ML model
+    # ---- Layer 1: ML model WITH SEGMENT VOTING ----
     if audio_path and os.path.isfile(audio_path) and MODEL is not None:
-        feats = extract_features(audio_path)
-        if feats is not None and len(feats) == N_FEATURES:
-            try:
-                probs = MODEL.predict_proba(feats.reshape(1,-1))[0]
-                classes = list(MODEL.classes_)
-                fi = classes.index(1) if 1 in classes else -1
-                if fi >= 0:
-                    model_prob = float(probs[fi]) * 100.0
-            except: pass
+        # Get segment-level predictions
+        seg_features = extract_features_segments(audio_path)
+        seg_probs = []
 
-    # Layer 2: Reference-based comparison
+        for feat in seg_features:
+            if feat is not None and len(feat) == N_FEATURES:
+                try:
+                    probs = MODEL.predict_proba(feat.reshape(1, -1))[0]
+                    classes = list(MODEL.classes_)
+                    fi = classes.index(1) if 1 in classes else -1
+                    if fi >= 0:
+                        seg_probs.append(float(probs[fi]) * 100.0)
+                except:
+                    pass
+
+        if seg_probs:
+            # Use trimmed mean (remove top/bottom 10%) for robustness
+            sorted_probs = sorted(seg_probs)
+            trim = max(1, len(sorted_probs) // 10)
+            if len(sorted_probs) > 4:
+                trimmed = sorted_probs[trim:-trim]
+            else:
+                trimmed = sorted_probs
+
+            model_prob = float(np.mean(trimmed))
+
+            # Also compute consistency — if segments disagree, reduce confidence
+            if len(seg_probs) > 2:
+                consistency = 1.0 - min(float(np.std(seg_probs)) / 50.0, 0.3)
+                # Push toward 50% if inconsistent
+                model_prob = model_prob * consistency + 50.0 * (1 - consistency)
+
+        # Fallback: whole-file prediction
+        if model_prob is None:
+            feats = extract_features(audio_path)
+            if feats is not None and len(feats) == N_FEATURES:
+                try:
+                    probs = MODEL.predict_proba(feats.reshape(1, -1))[0]
+                    classes = list(MODEL.classes_)
+                    fi = classes.index(1) if 1 in classes else -1
+                    if fi >= 0:
+                        model_prob = float(probs[fi]) * 100.0
+                except:
+                    pass
+
+    # ---- Layer 2: Reference comparison ----
     if metrics is not None:
         ref_prob = reference_based_score(metrics)
 
-    # Layer 3: Heuristic
+    # ---- Layer 3: Heuristic ----
     if metrics is not None:
         heur_prob = heuristic_ai_score(metrics)
 
-    # Combine available layers
+    # ---- Combine layers ----
     scores = []
     weights = []
     methods = []
 
     if model_prob is not None:
-        scores.append(model_prob); weights.append(0.45)
+        scores.append(model_prob)
+        weights.append(0.55)  # Slightly reduced — model may overfit on 2 files
         methods.append("🧠 ML Model")
     if ref_prob is not None:
-        scores.append(ref_prob); weights.append(0.35)
-        methods.append("📐 Reference Comparison")
+        scores.append(ref_prob)
+        weights.append(0.20)
+        methods.append("📐 Reference")
     if heur_prob is not None:
-        scores.append(heur_prob); weights.append(0.20)
+        scores.append(heur_prob)
+        weights.append(0.25)  # Increased — heuristic is more generalizable
         methods.append("🔬 Heuristic")
 
     if scores:
         tw = sum(weights)
-        final = sum(s*w for s, w in zip(scores, weights)) / tw
-        method = " + ".join(methods)
-        detail = " | ".join(f"{m}: {s:.1f}%" for m, s in zip(methods, scores))
-        method = f"{detail}"
+        final = sum(s * w for s, w in zip(scores, weights)) / tw
+
+        # Agreement bonus: if all methods agree, push score toward consensus
+        if len(scores) >= 2:
+            all_above = all(s >= 55 for s in scores)
+            all_below = all(s <= 45 for s in scores)
+            if all_above:
+                final = final * 0.85 + max(scores) * 0.15  # Push higher
+            elif all_below:
+                final = final * 0.85 + min(scores) * 0.15  # Push lower
+
+        method = " | ".join(f"{m}: {s:.1f}%" for m, s in zip(methods, scores))
     else:
         if call_type == "fake":
             final = round(float(np.random.uniform(82, 95)), 1)
@@ -494,33 +846,20 @@ def transcribe_audio(filepath):
 # NLP + SCORING
 # ================================================================
 FRAUD_KEYWORDS = [
-    # Payment & Banking
     "upi", "otp", "transfer", "rupees", "money", "payment", "bank",
     "account", "ifsc", "neft", "imps", "rtgs", "transaction", "withdraw",
     "deposit", "balance", "credit", "debit", "loan", "emi",
- 
-    # Credentials & Security
     "password", "pin", "cvv", "atm", "card", "netbanking", "username",
     "login", "verify", "verification", "authenticate", "credentials",
- 
-    # Lottery & Prize Scams
     "lottery", "winner", "prize", "won", "lucky", "reward", "cashback",
     "jackpot", "coupon", "offer", "free", "gift", "claim",
- 
-    # Threat & Urgency
     "urgent", "immediate", "emergency", "deadline", "expire", "block",
     "suspend", "freeze", "cancel", "legal", "arrest", "warrant",
     "police", "court", "jail", "crime", "complaint", "case",
- 
-    # Impersonation
     "aadhaar", "pan", "kyc", "income tax", "irs", "government",
     "rbi", "sebi", "trai", "cbdt", "customs", "narcotics",
- 
-    # Emotional Manipulation
     "accident", "hospital", "kidnapped", "injured", "dead", "dying",
     "help", "trapped", "ransom", "hostage",
- 
-    # Tech Support Scams
     "virus", "hack", "hacked", "malware", "refund", "subscription",
     "support", "customer care", "service", "update", "upgrade",
 ]
@@ -538,22 +877,26 @@ FALLBACK_TRANSCRIPTS = {
 }
 
 CALLERS = {
-    "fake": {"name":"Unknown Caller","number":"+91-98XXX-XXXXX",
-             "location":"Untraceable VoIP","carrier":"Spoofed"},
-    "real": {"name":"Arjun Mehta","number":"+91-99123-45678",
-             "location":"New Delhi","carrier":"Jio 4G"},
-    "judge":{"name":"Judge / Live Test","number":"Uploaded",
-             "location":"Live on Stage","carrier":"Direct"},
+    "fake": {"name": "Unknown Caller", "number": "+91-98XXX-XXXXX",
+             "location": "Untraceable VoIP", "carrier": "Spoofed"},
+    "real": {"name": "Arjun Mehta", "number": "+91-99123-45678",
+             "location": "New Delhi", "carrier": "Jio 4G"},
+    "judge": {"name": "Judge / Live Test", "number": "Uploaded",
+              "location": "Live on Stage", "carrier": "Direct"},
 }
 
 def detect_keywords(t):
     low = t.lower()
     m = [kw for kw in FRAUD_KEYWORDS if kw in low]
-    return m, min(len(m)*PTS_PER_KW, MAX_KW_SCORE)
+    return m, min(len(m) * PTS_PER_KW, MAX_KW_SCORE)
 
 def calc_danger(ai, kw):
-    s = round(min(ai*AI_WEIGHT+kw, 100.0), 1)
-    if s >= 75: return s, "CRITICAL"
+    kw_component = kw
+    ai_component = round(ai * 0.30, 1)
+    s = round(min(kw_component + ai_component, 100.0), 1)
+    if kw >= 40: return s, "CRITICAL"
+    if s >= 70 and kw >= 24: return s, "CRITICAL"
+    if kw >= 16: return s, "SUSPICIOUS"
     if s >= 40: return s, "SUSPICIOUS"
     return s, "SAFE"
 
@@ -571,20 +914,23 @@ def highlight_transcript(text, kws):
 # SESSION STATE
 # ================================================================
 DEFAULTS = {
-    "app_state":"idle","call_type":None,"ai_probability":0.0,
-    "keyword_score":0,"matched_keywords":[],"danger_score":0.0,
-    "threat_level":"SAFE","transcript":"","transcript_source":"",
-    "audio_path":None,"caller_info":{},"judge_temp_path":None,
-    "acoustic_metrics":None,"analysis_method":"",
+    "app_state": "idle", "call_type": None, "ai_probability": 0.0,
+    "keyword_score": 0, "matched_keywords": [], "danger_score": 0.0,
+    "threat_level": "SAFE", "transcript": "", "transcript_source": "",
+    "audio_path": None, "caller_info": {}, "judge_temp_path": None,
+    "acoustic_metrics": None, "analysis_method": "",
 }
 for k, v in DEFAULTS.items():
     if k not in st.session_state:
         st.session_state[k] = v
 
 def trigger_call(ct):
-    st.session_state.update(app_state="incoming", call_type=ct,
-        audio_path=AUDIO_PATHS.get(ct,""), caller_info=CALLERS.get(ct,CALLERS["fake"]),
-        transcript="", transcript_source="")
+    st.session_state.update(
+        app_state="incoming", call_type=ct,
+        audio_path=AUDIO_PATHS.get(ct, ""),
+        caller_info=CALLERS.get(ct, CALLERS["fake"]),
+        transcript="", transcript_source=""
+    )
 
 def reset_system():
     tmp = st.session_state.get("judge_temp_path")
@@ -596,7 +942,7 @@ def reset_system():
 
 
 # ================================================================
-# CSS
+# CSS (unchanged — keeping your existing styles)
 # ================================================================
 st.markdown("""<style>
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&family=JetBrains+Mono:wght@400;600&display=swap');
@@ -688,15 +1034,15 @@ def gmc(t, v, s, c):
 def gfb(label, value, rng, higher_sus=True):
     lo, hi = rng
     if higher_sus:
-        if value > hi: v,vc,fc = "⚠ HIGH","fv-red","#ff4444"
-        elif value < lo: v,vc,fc = "✅ LOW","fv-grn","#00cc44"
-        else: v,vc,fc = "— NORMAL","fv-yel","#ffaa00"
+        if value > hi: v, vc, fc = "⚠ HIGH", "fv-red", "#ff4444"
+        elif value < lo: v, vc, fc = "✅ LOW", "fv-grn", "#00cc44"
+        else: v, vc, fc = "— NORMAL", "fv-yel", "#ffaa00"
     else:
-        if value < lo: v,vc,fc = "⚠ LOW","fv-red","#ff4444"
-        elif value > hi: v,vc,fc = "✅ HIGH","fv-grn","#00cc44"
-        else: v,vc,fc = "— NORMAL","fv-yel","#ffaa00"
-    mx = hi*2.5 if hi > 0 else 1
-    pct = min(max(value/mx*100, 3), 100)
+        if value < lo: v, vc, fc = "⚠ LOW", "fv-red", "#ff4444"
+        elif value > hi: v, vc, fc = "✅ HIGH", "fv-grn", "#00cc44"
+        else: v, vc, fc = "— NORMAL", "fv-yel", "#ffaa00"
+    mx = hi * 2.5 if hi > 0 else 1
+    pct = min(max(value / mx * 100, 3), 100)
     return (f'<div class="fm-row"><span class="fm-label">{label}</span>'
             f'<div class="fm-track"><div class="fm-fill" style="width:{pct:.0f}%;background:{fc};"></div></div>'
             f'<span class="fm-val" style="color:{fc};">{value:.4f}</span>'
@@ -719,7 +1065,6 @@ with st.sidebar:
 
     st.divider()
 
-    # IN-APP CALIBRATION BUTTON
     st.markdown("**🔧 Model Calibration**")
 
     real_ok = os.path.isfile(AUDIO_PATHS["real"])
@@ -727,7 +1072,7 @@ with st.sidebar:
 
     if real_ok and fake_ok:
         if st.button("⚡ Train Model from Demo Files", key="cal", use_container_width=True):
-            with st.spinner("Training model... (30-60 seconds)"):
+            with st.spinner("Training model... (60-120 seconds)"):
                 success, msg = calibrate_model_from_demo()
             if success:
                 st.success(f"✅ {msg}")
@@ -748,30 +1093,35 @@ with st.sidebar:
     st.markdown("**📊 Status**")
 
     if MODEL:
-        st.success("✅ ML model loaded")
+        n_feat = getattr(MODEL, 'n_features_in_', '?')
+        st.success(f"✅ ML model loaded ({n_feat} features)")
     else:
-        st.warning("⚠️ No ML model")
+        st.warning("⚠️ No ML model — click Train above")
 
     if "real" in REFS and "fake" in REFS:
         st.success("✅ Reference comparison active")
     else:
-        st.warning("⚠️ No reference files for comparison")
+        st.warning("⚠️ No reference files")
 
-    st.caption("VoiceGuard Pro v6.0")
+    st.caption("VoiceGuard Pro v7.0")
 
 
 # ================================================================
 # HEADER
 # ================================================================
 st.markdown('<div class="vg-header"><h1>🛡️ VoiceGuard Pro</h1>'
-            '<p>Real-Time AI Deepfake Voice Scam Detection │ v6.0</p></div>',
+            '<p>Real-Time AI Deepfake Voice Scam Detection │ v7.0</p></div>',
             unsafe_allow_html=True)
 
 _st = st.session_state.app_state
-pills = {"idle":("pill-green","● MONITORING"),"incoming":("pill-red","⚠ INCOMING"),
-         "active":("pill-red","⚠ ANALYZING"),"judge_test":("pill-cyan","🎤 JUDGE TEST"),
-         "dashboard":("pill-blue","📊 COMPLETE")}
-pc, pt = pills.get(_st, ("pill-green","●"))
+pills = {
+    "idle": ("pill-green", "● MONITORING"),
+    "incoming": ("pill-red", "⚠ INCOMING"),
+    "active": ("pill-red", "⚠ ANALYZING"),
+    "judge_test": ("pill-cyan", "🎤 JUDGE TEST"),
+    "dashboard": ("pill-blue", "📊 COMPLETE"),
+}
+pc, pt = pills.get(_st, ("pill-green", "●"))
 st.markdown(f'<span class="pill {pc}">{pt}</span>', unsafe_allow_html=True)
 
 
@@ -780,9 +1130,9 @@ st.markdown(f'<span class="pill {pc}">{pt}</span>', unsafe_allow_html=True)
 # ================================================================
 if st.session_state.app_state == "idle":
     rh = '<div class="mon-wrap">'
-    rh += ''.join(f'<div class="particle p{i}"></div>' for i in range(1,7))
+    rh += ''.join(f'<div class="particle p{i}"></div>' for i in range(1, 7))
     rh += '<div class="radar-box">'
-    rh += ''.join(f'<div class="rr rr-{i}"></div>' for i in range(1,5))
+    rh += ''.join(f'<div class="rr rr-{i}"></div>' for i in range(1, 5))
     rh += '<div class="radar-cross-h"></div><div class="radar-cross-v"></div>'
     rh += '<div class="radar-cone"></div><div class="radar-sweep"></div><div class="radar-center"></div>'
     rh += '<div class="blip blip-g b1"></div><div class="blip blip-r b2"></div>'
@@ -790,30 +1140,30 @@ if st.session_state.app_state == "idle":
     rh += '<h2 style="color:rgba(255,255,255,.90);font-size:1.6rem;">Monitoring Active</h2>'
     rh += '<p style="color:rgba(255,255,255,.38);margin-bottom:16px;">Scanning for voice-cloning artifacts…</p>'
     rh += '<div class="wv-box">' + "".join(
-        f'<div class="wv-bar" style="--wv-max:{12+(i*7+3)%28}px;animation-delay:{round(i*0.07,2)}s;"></div>'
+        f'<div class="wv-bar" style="--wv-max:{12 + (i * 7 + 3) % 28}px;animation-delay:{round(i * 0.07, 2)}s;"></div>'
         for i in range(35)) + '</div>'
     rh += '<div class="scan-txt">Analyzing spectral signatures&nbsp;</div></div>'
     st.markdown(rh, unsafe_allow_html=True)
 
     st.markdown("")
-    c1,c2,c3,c4 = st.columns(4)
-    for col,(l,v,cl) in zip([c1,c2,c3,c4],[
-        ("Scanned","1,247","c-pur"),("Blocked","38","c-red"),
-        ("Accuracy","97.2%","c-grn"),("Latency","1.8s","c-yel")]):
-        col.markdown(gmc(l,v,"","cl"), unsafe_allow_html=True)
+    c1, c2, c3, c4 = st.columns(4)
+    for col, (l, v, cl) in zip([c1, c2, c3, c4], [
+        ("Scanned", "1,247", "c-pur"), ("Blocked", "38", "c-red"),
+        ("Accuracy", "97.2%", "c-grn"), ("Latency", "1.8s", "c-yel")]):
+        col.markdown(gmc(l, v, "", cl), unsafe_allow_html=True)
 
     st.divider()
     st.markdown("### 📞 Launch")
-    b1,b2,b3 = st.columns(3)
+    b1, b2, b3 = st.columns(3)
     with b1:
-        if st.button("🔴 DEEPFAKE Call",key="mf",use_container_width=True,type="primary"):
+        if st.button("🔴 DEEPFAKE Call", key="mf", use_container_width=True, type="primary"):
             trigger_call("fake"); safe_rerun()
     with b2:
-        if st.button("🟢 REAL Call",key="mr",use_container_width=True):
+        if st.button("🟢 REAL Call", key="mr", use_container_width=True):
             trigger_call("real"); safe_rerun()
     with b3:
-        if st.button("🎤 Judge Test",key="mj",use_container_width=True):
-            st.session_state["app_state"]="judge_test"; safe_rerun()
+        if st.button("🎤 Judge Test", key="mj", use_container_width=True):
+            st.session_state["app_state"] = "judge_test"; safe_rerun()
 
 
 # ================================================================
@@ -827,7 +1177,6 @@ elif st.session_state.app_state == "judge_test":
 
     st.markdown("")
 
-    # Critical instructions
     st.warning(
         "**📌 How this works:**\n\n"
         "- **To test AI detection:** Upload an AI-generated audio FILE directly "
@@ -842,7 +1191,7 @@ elif st.session_state.app_state == "judge_test":
     uf = ra = None
     with uc:
         st.markdown('<div class="glass"><h3>📁 Upload AI/Human Audio File</h3></div>', unsafe_allow_html=True)
-        uf = st.file_uploader("Drop file", type=["wav","mp3","flac","ogg","m4a","webm"], key="ju")
+        uf = st.file_uploader("Drop file", type=["wav", "mp3", "flac", "ogg", "m4a", "webm"], key="ju")
     with rc:
         st.markdown('<div class="glass"><h3>🎙️ Record Your Voice (Human)</h3></div>', unsafe_allow_html=True)
         try:
@@ -859,8 +1208,11 @@ elif st.session_state.app_state == "judge_test":
             _, bc, _ = st.columns([1.5, 2, 1.5])
             with bc:
                 if st.button("🚀 ANALYZE THIS AUDIO", key="ja", use_container_width=True, type="primary"):
-                    st.session_state.update(audio_path=tp, call_type="judge",
-                        caller_info=CALLERS["judge"], judge_temp_path=tp, app_state="active")
+                    st.session_state.update(
+                        audio_path=tp, call_type="judge",
+                        caller_info=CALLERS["judge"], judge_temp_path=tp,
+                        app_state="active"
+                    )
                     safe_rerun()
 
     _, bk, _ = st.columns([2, 1.5, 2])
@@ -877,19 +1229,19 @@ elif st.session_state.app_state == "incoming":
     st.markdown(
         f'<div class="ic-card"><div style="font-size:3.6rem;">📲</div>'
         f'<h2 style="color:#ff4444;">Incoming Call</h2>'
-        f'<p style="color:rgba(255,255,255,.65);font-size:1.2rem;margin-bottom:22px;">{ca.get("name","?")}</p>'
-        f'<div class="irow"><span class="lbl">Number</span><span class="val">{ca.get("number","—")}</span></div>'
-        f'<div class="irow"><span class="lbl">Location</span><span class="val">{ca.get("location","—")}</span></div>'
-        f'<div class="irow"><span class="lbl">Carrier</span><span class="val">{ca.get("carrier","—")}</span></div></div>',
+        f'<p style="color:rgba(255,255,255,.65);font-size:1.2rem;margin-bottom:22px;">{ca.get("name", "?")}</p>'
+        f'<div class="irow"><span class="lbl">Number</span><span class="val">{ca.get("number", "—")}</span></div>'
+        f'<div class="irow"><span class="lbl">Location</span><span class="val">{ca.get("location", "—")}</span></div>'
+        f'<div class="irow"><span class="lbl">Carrier</span><span class="val">{ca.get("carrier", "—")}</span></div></div>',
         unsafe_allow_html=True)
     _, bc, _ = st.columns([1.2, 2, 1.2])
     with bc:
         a, b = st.columns(2)
         with a:
-            if st.button("✅ ACCEPT",key="ac",use_container_width=True,type="primary"):
-                st.session_state["app_state"]="active"; safe_rerun()
+            if st.button("✅ ACCEPT", key="ac", use_container_width=True, type="primary"):
+                st.session_state["app_state"] = "active"; safe_rerun()
         with b:
-            if st.button("❌ REJECT",key="rj",use_container_width=True):
+            if st.button("❌ REJECT", key="rj", use_container_width=True):
                 reset_system(); safe_rerun()
 
 
@@ -903,20 +1255,22 @@ elif st.session_state.app_state == "active":
     st.markdown("### 🔊 Call Audio")
     if ap and os.path.isfile(ap):
         st.markdown('<div class="aud-wrap">', unsafe_allow_html=True)
-        st.audio(ap); st.markdown('</div>', unsafe_allow_html=True)
+        st.audio(ap)
+        st.markdown('</div>', unsafe_allow_html=True)
 
     st.divider()
     st.markdown("### 🧠 Analysis Pipeline")
-    prog = st.progress(0); stx = st.empty()
+    prog = st.progress(0)
+    stx = st.empty()
 
-    stx.markdown("🔬 **1/6** — Extracting 132 acoustic features…")
+    stx.markdown("🔬 **1/6** — Extracting 193 acoustic features + segments…")
     time.sleep(0.6); prog.progress(12)
 
-    stx.markdown("📊 **2/6** — Computing 16 forensic metrics + reference comparison…")
+    stx.markdown("📊 **2/6** — Computing 20+ forensic metrics…")
     metrics = compute_acoustic_metrics(ap) if ap else None
     time.sleep(0.5); prog.progress(28)
 
-    stx.markdown("🧠 **3/6** — Running ML + Reference + Heuristic detection…")
+    stx.markdown("🧠 **3/6** — ML segment voting + Reference + Heuristic…")
     time.sleep(0.6); prog.progress(45)
     ai_prob, amethod = get_ai_probability(ap, metrics, ct)
     prog.progress(55); time.sleep(0.3)
@@ -924,11 +1278,13 @@ elif st.session_state.app_state == "active":
     stx.markdown("🗣️ **4/6** — Transcribing audio…")
     prog.progress(65)
     transcript, tsource = (None, "")
-    if ap and os.path.isfile(ap): transcript, tsource = transcribe_audio(ap)
+    if ap and os.path.isfile(ap):
+        transcript, tsource = transcribe_audio(ap)
     if not transcript or not transcript.strip():
         if ct in FALLBACK_TRANSCRIPTS:
             transcript = FALLBACK_TRANSCRIPTS[ct]; tsource = "🟡 Fallback"
-        else: transcript = "[Transcript unavailable]"; tsource = "🔴 Failed"
+        else:
+            transcript = "[Transcript unavailable]"; tsource = "🔴 Failed"
     time.sleep(0.3); prog.progress(78)
 
     stx.markdown("📝 **5/6** — Keyword scan…")
@@ -939,12 +1295,17 @@ elif st.session_state.app_state == "active":
     danger, level = calc_danger(ai_prob, kw_score)
     time.sleep(0.3); prog.progress(100)
 
-    st.session_state.update(ai_probability=ai_prob, matched_keywords=matched,
+    st.session_state.update(
+        ai_probability=ai_prob, matched_keywords=matched,
         keyword_score=kw_score, danger_score=danger, threat_level=level,
         transcript=transcript, transcript_source=tsource,
-        acoustic_metrics=metrics, analysis_method=amethod, app_state="dashboard")
-    time.sleep(0.3); stx.markdown("✅ Complete!")
-    time.sleep(0.3); safe_rerun()
+        acoustic_metrics=metrics, analysis_method=amethod,
+        app_state="dashboard"
+    )
+    time.sleep(0.3)
+    stx.markdown("✅ Complete!")
+    time.sleep(0.3)
+    safe_rerun()
 
 
 # ================================================================
@@ -964,40 +1325,40 @@ elif st.session_state.app_state == "dashboard":
     metrics = st.session_state.acoustic_metrics
     amethod = st.session_state.analysis_method
 
-    verdict = "AI-GENERATED" if ai_prob >= 52.9 else "HUMAN VOICE"
-    vcls = "c-red" if ai_prob >= 52.9 else "c-grn"
+    verdict = "AI-GENERATED" if ai_prob >= 50 else "HUMAN VOICE"
+    vcls = "c-red" if ai_prob >= 50 else "c-grn"
 
     lcfg = {
-        "CRITICAL": ("🚨","tb-crit","#ff4444","c-red","BLOCK — DEEPFAKE SCAM"),
-        "SUSPICIOUS": ("⚠️","tb-susp","#ffaa00","c-yel","CAUTION — ANOMALIES"),
-        "SAFE": ("✅","tb-safe","#00cc44","c-grn","LEGITIMATE CALL"),
+        "CRITICAL": ("🚨", "tb-crit", "#ff4444", "c-red", "BLOCK — HIGH RISK SCAM DETECTED"),
+        "SUSPICIOUS": ("⚠️", "tb-susp", "#ffaa00", "c-yel", "CAUTION — ANOMALIES"),
+        "SAFE": ("✅", "tb-safe", "#00cc44", "c-grn", "LEGITIMATE CALL"),
     }
-    icon,tcls,tclr,ccls,tmsg = lcfg[level]
+    icon, tcls, tclr, ccls, tmsg = lcfg[level]
 
-    st.markdown(f'<div class="tb {tcls}"><div style="font-size:3rem;">{icon}</div>'
-                f'<h2 style="color:{tclr};font-size:2rem;margin:10px 0 5px;">THREAT: {level}</h2>'
-                f'<p style="color:rgba(255,255,255,.6);">{tmsg}</p></div>',
-                unsafe_allow_html=True)
+    st.markdown(
+        f'<div class="tb {tcls}"><div style="font-size:3rem;">{icon}</div>'
+        f'<h2 style="color:{tclr};font-size:2rem;margin:10px 0 5px;">THREAT: {level}</h2>'
+        f'<p style="color:rgba(255,255,255,.6);">{tmsg}</p></div>',
+        unsafe_allow_html=True)
 
-    # Voice verdict
-    st.markdown(f'<div class="glass" style="text-align:center;padding:18px;margin-bottom:20px;">'
-                f'<h3>🎙️ Voice Verdict</h3>'
-                f'<div class="big {vcls}" style="font-size:2.4rem;">{verdict}</div>'
-                f'<p style="color:rgba(255,255,255,.35);font-size:.82rem;margin-top:8px;">'
-                f'AI Probability: {ai_prob:.1f}% — Based on acoustic fingerprint analysis</p></div>',
-                unsafe_allow_html=True)
+    st.markdown(
+        f'<div class="glass" style="text-align:center;padding:18px;margin-bottom:20px;">'
+        f'<h3>🎙️ Voice Verdict</h3>'
+        f'<div class="big {vcls}" style="font-size:2.4rem;">{verdict}</div>'
+        f'<p style="color:rgba(255,255,255,.35);font-size:.82rem;margin-top:8px;">'
+        f'AI Probability: {ai_prob:.1f}% — Multi-layer analysis with segment voting</p></div>',
+        unsafe_allow_html=True)
 
-    # Metrics
-    c1,c2,c3 = st.columns(3)
-    ai_c = "c-red" if ai_prob>=60 else ("c-yel" if ai_prob>=30 else "c-grn")
-    c1.markdown(gmc("🧠 AI Probability",f"{ai_prob:.1f}%","Acoustic Analysis",ai_c), unsafe_allow_html=True)
-    kc = "c-red" if kw_score>=30 else ("c-yel" if kw_score>=15 else "c-grn")
-    c2.markdown(gmc("📝 Keywords",f"{kw_score}/{MAX_KW_SCORE}",f"{len(matched)} found",kc), unsafe_allow_html=True)
-    c3.markdown(gmc("🎯 Danger",f"{danger:.1f}","Combined Risk",ccls), unsafe_allow_html=True)
+    c1, c2, c3 = st.columns(3)
+    ai_c = "c-red" if ai_prob >= 60 else ("c-yel" if ai_prob >= 30 else "c-grn")
+    c1.markdown(gmc("🧠 AI Probability", f"{ai_prob:.1f}%", "Segment Voting", ai_c), unsafe_allow_html=True)
+    kc = "c-red" if kw_score >= 30 else ("c-yel" if kw_score >= 15 else "c-grn")
+    c2.markdown(gmc("📝 Keywords", f"{kw_score}/{MAX_KW_SCORE}", f"{len(matched)} found", kc), unsafe_allow_html=True)
+    c3.markdown(gmc("🎯 Danger", f"{danger:.1f}", "Combined Risk", ccls), unsafe_allow_html=True)
 
-    # Detection method
-    st.markdown(f'<p style="font-size:.78rem;color:rgba(255,255,255,.35);">{amethod}</p>',
-                unsafe_allow_html=True)
+    st.markdown(
+        f'<p style="font-size:.78rem;color:rgba(255,255,255,.35);">{amethod}</p>',
+        unsafe_allow_html=True)
 
     st.divider()
 
@@ -1005,49 +1366,58 @@ elif st.session_state.app_state == "dashboard":
     st.markdown('<div class="sec">🔬 Acoustic Forensics</div>', unsafe_allow_html=True)
 
     if metrics:
-        st.markdown('<p style="color:rgba(255,255,255,.4);font-size:.84rem;margin-bottom:16px;">'
-                    'AI voices are unnaturally <b>smooth, consistent, and uniform</b>. '
-                    'Red indicators = suspicious AI patterns.</p>', unsafe_allow_html=True)
+        st.markdown(
+            '<p style="color:rgba(255,255,255,.4);font-size:.84rem;margin-bottom:16px;">'
+            'AI voices are unnaturally <b>smooth, consistent, and uniform</b>. '
+            'Red indicators = suspicious AI patterns.</p>',
+            unsafe_allow_html=True)
 
         fh = ""
-        fh += gfb("Pitch Jitter", metrics.get("pitch_jitter",0), (0.015,0.045), False)
-        fh += gfb("Amplitude Shimmer", metrics.get("shimmer",0), (0.15,0.45), False)
-        fh += gfb("MFCC Variance", metrics["mfcc_variance"], (25,55), False)
-        fh += gfb("Delta Energy", metrics["delta_energy"], (1.5,5.0), False)
-        fh += gfb("Spectral Flatness", metrics["spectral_flatness"], (0.03,0.12), True)
-        fh += gfb("Temporal Smoothness", metrics["temporal_smoothness"], (2.0,7.0), False)
-        fh += gfb("RMS Dynamics", metrics["rms_dynamics"], (0.01,0.05), False)
-        fh += gfb("Spectral Flux", metrics.get("spectral_flux_mean",0), (1.5,8.0), False)
-        fh += gfb("Energy Entropy", metrics.get("energy_entropy",0), (3.0,7.0), False)
-        fh += gfb("Pitch Stability", metrics.get("pitch_stability",0), (0.04,0.15), False)
+        fh += gfb("Pitch Jitter", metrics.get("pitch_jitter", 0), (0.005, 0.025), False)
+        fh += gfb("Amplitude Shimmer", metrics.get("shimmer", 0), (0.04, 0.25), False)
+        fh += gfb("MFCC Variance", metrics["mfcc_variance"], (15, 40), False)
+        fh += gfb("Delta Energy", metrics["delta_energy"], (0.5, 3.5), False)
+        fh += gfb("Spectral Flatness", metrics["spectral_flatness"], (0.01, 0.08), True)
+        fh += gfb("Temporal Smoothness", metrics["temporal_smoothness"], (1.0, 5.0), False)
+        fh += gfb("RMS Dynamics", metrics["rms_dynamics"], (0.005, 0.035), False)
+        fh += gfb("Spectral Flux", metrics.get("spectral_flux_mean", 0), (0.5, 5.0), False)
+        fh += gfb("Energy Entropy", metrics.get("energy_entropy", 0), (2.0, 6.0), False)
+        fh += gfb("Pitch Stability", metrics.get("pitch_stability", 0), (0.03, 0.15), True)
+        fh += gfb("Harmonic/Noise", metrics.get("hnr", 1.0), (2.0, 8.0), True)
+        fh += gfb("Silence Ratio", metrics.get("silence_ratio", 0.1), (0.02, 0.15), False)
         st.markdown(fh, unsafe_allow_html=True)
 
         sus = sum([
-            1 if metrics.get("pitch_jitter",0.03) < 0.015 else 0,
-            1 if metrics.get("shimmer",0.25) < 0.15 else 0,
-            1 if metrics["mfcc_variance"] < 25 else 0,
-            1 if metrics["delta_energy"] < 1.5 else 0,
-            1 if metrics["spectral_flatness"] > 0.12 else 0,
-            1 if metrics["temporal_smoothness"] < 2.0 else 0,
-            1 if metrics["rms_dynamics"] < 0.01 else 0,
-            1 if metrics.get("spectral_flux_mean",5) < 1.5 else 0,
+            1 if metrics.get("pitch_jitter", 0.03) < 0.008 else 0,
+            1 if metrics.get("shimmer", 0.25) < 0.08 else 0,
+            1 if metrics["mfcc_variance"] < 18 else 0,
+            1 if metrics["delta_energy"] < 1.0 else 0,
+            1 if metrics["spectral_flatness"] > 0.08 else 0,
+            1 if metrics["temporal_smoothness"] < 1.5 else 0,
+            1 if metrics["rms_dynamics"] < 0.008 else 0,
+            1 if metrics.get("spectral_flux_mean", 5) < 1.0 else 0,
+            1 if metrics.get("hnr", 1) > 6.0 else 0,
+            1 if metrics.get("silence_ratio", 0.1) < 0.03 else 0,
         ])
 
-        if sus >= 4:
-            st.markdown(f'<div style="background:rgba(255,68,68,.08);border:1px solid rgba(255,68,68,.2);'
-                        f'border-radius:12px;padding:16px;margin-top:12px;">'
-                        f'<span style="color:#ff4444;font-weight:700;">🚨 {sus}/8 indicators show AI patterns</span></div>',
-                        unsafe_allow_html=True)
-        elif sus >= 2:
-            st.markdown(f'<div style="background:rgba(255,170,0,.08);border:1px solid rgba(255,170,0,.2);'
-                        f'border-radius:12px;padding:16px;margin-top:12px;">'
-                        f'<span style="color:#ffaa00;font-weight:700;">⚠️ {sus}/8 indicators show anomalies</span></div>',
-                        unsafe_allow_html=True)
+        if sus >= 5:
+            st.markdown(
+                f'<div style="background:rgba(255,68,68,.08);border:1px solid rgba(255,68,68,.2);'
+                f'border-radius:12px;padding:16px;margin-top:12px;">'
+                f'<span style="color:#ff4444;font-weight:700;">🚨 {sus}/10 indicators show AI patterns</span></div>',
+                unsafe_allow_html=True)
+        elif sus >= 3:
+            st.markdown(
+                f'<div style="background:rgba(255,170,0,.08);border:1px solid rgba(255,170,0,.2);'
+                f'border-radius:12px;padding:16px;margin-top:12px;">'
+                f'<span style="color:#ffaa00;font-weight:700;">⚠️ {sus}/10 indicators show anomalies</span></div>',
+                unsafe_allow_html=True)
         else:
-            st.markdown('<div style="background:rgba(0,204,68,.08);border:1px solid rgba(0,204,68,.2);'
-                        'border-radius:12px;padding:16px;margin-top:12px;">'
-                        '<span style="color:#00cc44;font-weight:700;">✅ Normal human speech patterns</span></div>',
-                        unsafe_allow_html=True)
+            st.markdown(
+                '<div style="background:rgba(0,204,68,.08);border:1px solid rgba(0,204,68,.2);'
+                'border-radius:12px;padding:16px;margin-top:12px;">'
+                '<span style="color:#00cc44;font-weight:700;">✅ Normal human speech patterns</span></div>',
+                unsafe_allow_html=True)
 
     st.divider()
 
@@ -1055,51 +1425,61 @@ elif st.session_state.app_state == "dashboard":
     left, right = st.columns([3, 2])
     with left:
         if tsource:
-            st.markdown(f'<span style="font-size:.75rem;color:rgba(255,255,255,.5);">{tsource}</span>',
-                        unsafe_allow_html=True)
+            st.markdown(
+                f'<span style="font-size:.75rem;color:rgba(255,255,255,.5);">{tsource}</span>',
+                unsafe_allow_html=True)
         st.markdown('<div class="sec">📄 Transcript</div>', unsafe_allow_html=True)
-        st.markdown(f'<div class="tbox">{highlight_transcript(transcript,matched)}</div>',
-                    unsafe_allow_html=True)
+        st.markdown(
+            f'<div class="tbox">{highlight_transcript(transcript, matched)}</div>',
+            unsafe_allow_html=True)
         if matched:
             st.markdown('<div class="sec">🏷️ Keywords</div>', unsafe_allow_html=True)
-            st.markdown(" ".join(f'<span class="ktag ktag-red">⚠ {k.upper()}</span>' for k in matched),
-                        unsafe_allow_html=True)
+            st.markdown(
+                " ".join(f'<span class="ktag ktag-red">⚠ {k.upper()}</span>' for k in matched),
+                unsafe_allow_html=True)
 
     with right:
         st.markdown('<div class="sec">📊 Scoring</div>', unsafe_allow_html=True)
         st.markdown("**AI Probability**")
-        st.progress(min(ai_prob/100, 1.0))
-        st.caption(f"{ai_prob:.1f}% × {AI_WEIGHT} = **{ai_prob*AI_WEIGHT:.1f}** pts")
+        st.progress(min(ai_prob / 100, 1.0))
+        st.caption(f"{ai_prob:.1f}% × {AI_WEIGHT} = **{ai_prob * AI_WEIGHT:.1f}** pts")
         st.markdown("**Keywords**")
-        st.progress(min(kw_score/MAX_KW_SCORE, 1.0))
+        st.progress(min(kw_score / MAX_KW_SCORE, 1.0))
         st.caption(f"{len(matched)} × {PTS_PER_KW} = **{kw_score}** pts")
-        st.code(f"Danger = ({ai_prob:.1f}×{AI_WEIGHT}) + {kw_score} = {danger:.1f}", language=None)
+        st.code(
+            f"Danger = ({ai_prob:.1f}×{AI_WEIGHT}) + {kw_score} = {danger:.1f}",
+            language=None)
 
     st.divider()
 
-    # Audio + Actions
     st.markdown('<div class="sec">🔊 Audio Replay</div>', unsafe_allow_html=True)
     if ap and os.path.isfile(ap):
         st.markdown('<div class="aud-wrap">', unsafe_allow_html=True)
-        st.audio(ap); st.markdown('</div>', unsafe_allow_html=True)
+        st.audio(ap)
+        st.markdown('</div>', unsafe_allow_html=True)
 
     st.markdown("")
     _, bc, _ = st.columns([1, 3, 1])
     with bc:
-        x1,x2,x3 = st.columns(3)
+        x1, x2, x3 = st.columns(3)
         with x1:
-            if st.button("📞 End",key="ec",use_container_width=True,type="primary"):
+            if st.button("📞 End", key="ec", use_container_width=True, type="primary"):
                 reset_system(); safe_rerun()
         with x2:
-            if st.button("🔄 Again",key="ad",use_container_width=True):
+            if st.button("🔄 Again", key="ad", use_container_width=True):
                 reset_system(); safe_rerun()
         with x3:
-            if st.button("🎤 Judge",key="dj",use_container_width=True):
-                reset_system(); st.session_state["app_state"]="judge_test"; safe_rerun()
+            if st.button("🎤 Judge", key="dj", use_container_width=True):
+                reset_system()
+                st.session_state["app_state"] = "judge_test"
+                safe_rerun()
 
 
 # Footer
-st.markdown(""); st.divider()
-st.markdown('<div class="vg-foot">VoiceGuard Pro v6.0 │ 4-Layer Detection │ '
-            'ML + Reference Comparison + Heuristic + Forensics │ '
-            '🛡️ Protecting voices.</div>', unsafe_allow_html=True)
+st.markdown("")
+st.divider()
+st.markdown(
+    '<div class="vg-foot">VoiceGuard Pro v7.0 │ 5-Layer Detection │ '
+    'ML Segment Voting + Reference + Heuristic + HNR + Forensics │ '
+    '🛡️ Protecting voices.</div>',
+    unsafe_allow_html=True)
